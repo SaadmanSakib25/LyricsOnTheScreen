@@ -3,3 +3,9 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# PC preview tool outputs (tools/preview)
+*.exe
+*.pdb
+frames.bin
+sheet.png

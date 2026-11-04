@@ -10,9 +10,11 @@
 #include "driver/spi_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "lyric_fx.h"
 #include "lyrics_data.h"
@@ -41,6 +43,8 @@ static const char *TAG = "LYRIC_SCREEN";
 #define LCD_OFFSET_Y 0
 
 #define SPI_HOST     SPI2_HOST
+#define LCD_DMA_CHUNK  4096
+#define LCD_DMA_CHUNKS ((LCD_WIDTH * LCD_HEIGHT * 2 + LCD_DMA_CHUNK - 1) / LCD_DMA_CHUNK)
 #define SPI_CLOCK_HZ (15 * 1000 * 1000) // 15 MHz (ST7735 safe rating, eliminates breadboard clock jitter)
 
 /* Backlight brightness (0-255). 255 = 100% steady DC, eliminates PWM switching ripple */
@@ -50,7 +54,8 @@ static const char *TAG = "LYRIC_SCREEN";
  * Global State
  * ========================================================================= */
 static spi_device_handle_t display;
-static uint16_t frame[LCD_WIDTH * LCD_HEIGHT]; /* RGB565, rendered by lyric_fx.c */
+/* Two RGB565 frames: one is rendered while the other is streamed out by DMA. */
+static uint16_t frames[FX_SLOTS][LCD_WIDTH * LCD_HEIGHT];
 _Static_assert(LCD_WIDTH == FX_WIDTH && LCD_HEIGHT == FX_HEIGHT, "renderer size must match panel");
 
 typedef struct {
@@ -148,7 +153,7 @@ static void lcd_init(void)
         .clock_speed_hz = SPI_CLOCK_HZ,
         .mode = 0,
         .spics_io_num = LCD_CS,
-        .queue_size = 1,
+        .queue_size = LCD_DMA_CHUNKS + 2,
     };
     ESP_ERROR_CHECK(spi_bus_add_device(SPI_HOST, &device_config, &display));
 
@@ -273,15 +278,43 @@ static void backlight_init(void)
     ESP_ERROR_CHECK(ledc_channel_config(&channel));
 }
 
-static void lcd_present(void)
+static spi_transaction_t s_frame_trans[LCD_DMA_CHUNKS];
+static int s_frame_inflight;
+
+/* Block until the previously queued frame has been fully sent. */
+static void lcd_wait_frame_done(void)
 {
-    /* ST7735 expects big-endian RGB565; the frame is fully redrawn every tick,
-     * so swapping in place is fine. */
-    for (size_t i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
-        frame[i] = (uint16_t)((frame[i] >> 8) | (frame[i] << 8));
+    while (s_frame_inflight > 0) {
+        spi_transaction_t *done;
+        ESP_ERROR_CHECK(spi_device_get_trans_result(display, &done, portMAX_DELAY));
+        s_frame_inflight--;
     }
+}
+
+/* Start streaming a frame to the panel in the background (DMA). */
+static void lcd_present_async(uint16_t *buf)
+{
+    /* ST7735 expects big-endian RGB565; the buffer is redrawn from scratch next time */
+    for (size_t i = 0; i < LCD_WIDTH * LCD_HEIGHT; i++) {
+        buf[i] = (uint16_t)((buf[i] >> 8) | (buf[i] << 8));
+    }
+    lcd_wait_frame_done();
     lcd_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
-    lcd_data(frame, sizeof(frame));
+    gpio_set_level(LCD_DC, 1);
+
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t remaining = LCD_WIDTH * LCD_HEIGHT * 2;
+    for (int n = 0; remaining > 0; n++) {
+        size_t chunk = remaining > LCD_DMA_CHUNK ? LCD_DMA_CHUNK : remaining;
+        spi_transaction_t *t = &s_frame_trans[n];
+        memset(t, 0, sizeof(*t));
+        t->length = chunk * 8;
+        t->tx_buffer = p;
+        ESP_ERROR_CHECK(spi_device_queue_trans(display, t, portMAX_DELAY));
+        s_frame_inflight++;
+        p += chunk;
+        remaining -= chunk;
+    }
 }
 
 /* =========================================================================
@@ -398,6 +431,97 @@ static void handle_serial_input(playback_state_t *ps)
 }
 
 /* =========================================================================
+ * Two-core render pipeline
+ *   core 1, draw task : playback clock, input, fx_draw_frame()   (frame N+1)
+ *   core 0, app_main  : fx_finish_frame() + DMA to the panel     (frame N)
+ * A frame buffer travels  free_q -> draw -> ready_q -> finish/send -> free_q
+ * ========================================================================= */
+#define FRAME_MS 40 /* 25 FPS */
+
+typedef struct {
+    int slot;
+    fx_post_t post;
+    int64_t draw_us;
+} frame_msg_t;
+
+static QueueHandle_t s_free_q, s_ready_q;
+
+static void draw_task(void *arg)
+{
+    (void)arg;
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL)); /* this task feeds the watchdog itself */
+
+    size_t last_logged_index = SIZE_MAX;
+    g_playback.last_timer_us = esp_timer_get_time();
+    TickType_t last_wake = xTaskGetTickCount();
+
+    while (true) {
+        uint64_t now_us = esp_timer_get_time();
+
+        // Advance playback clock if playing
+        if (g_playback.is_playing) {
+            uint32_t delta_ms = (uint32_t)((now_us - g_playback.last_timer_us) / 1000);
+            // Keep the sub-millisecond remainder so the clock doesn't drift behind the audio
+            g_playback.last_timer_us += (uint64_t)delta_ms * 1000;
+            g_playback.current_ms += delta_ms;
+
+            if (g_playback.current_ms >= SONG_TOTAL_DURATION_MS + FX_END_HOLD_MS) {
+                // Auto-loop back to the start after the closing title card
+                g_playback.current_ms = 0;
+                g_playback.active_index = 0;
+                ESP_LOGI(TAG, "Song completed, looping to start...");
+            }
+        } else {
+            g_playback.last_timer_us = now_us;
+        }
+
+        g_playback.active_index = find_active_lyric(g_playback.current_ms);
+        if (g_playback.active_index != last_logged_index) {
+            last_logged_index = g_playback.active_index;
+            uint32_t s = g_playback.current_ms / 1000;
+            ESP_LOGI(TAG, "[%02lu:%02lu] %s",
+                     (unsigned long)(s / 60), (unsigned long)(s % 60),
+                     lyrics[g_playback.active_index].text);
+        }
+
+        handle_button_input(&g_playback);
+        handle_serial_input(&g_playback);
+
+        // Draw the next frame into a free buffer while core 0 finishes/sends the last one
+        frame_msg_t msg;
+        xQueueReceive(s_free_q, &msg.slot, portMAX_DELAY);
+        int64_t t0 = esp_timer_get_time();
+        fx_draw_frame(msg.slot, frames[msg.slot], g_playback.current_ms, g_playback.active_index,
+                      g_playback.animation_tick, g_playback.is_playing, &msg.post);
+        msg.draw_us = esp_timer_get_time() - t0;
+        xQueueSend(s_ready_q, &msg, portMAX_DELAY);
+        g_playback.animation_tick++;
+
+        esp_task_wdt_reset();
+        if (xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(FRAME_MS)) == pdFALSE) {
+            last_wake = xTaskGetTickCount(); /* running late: don't try to catch up */
+        }
+    }
+}
+
+static void watchdog_setup(void)
+{
+    /* Only watch core 0's idle task: core 1 is busy drawing and feeds the WDT itself. */
+    esp_task_wdt_config_t cfg = {
+        .timeout_ms = CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000,
+        .idle_core_mask = BIT(0),
+#ifdef CONFIG_ESP_TASK_WDT_PANIC
+        .trigger_panic = true,
+#else
+        .trigger_panic = false,
+#endif
+    };
+    esp_err_t err = esp_task_wdt_reconfigure(&cfg);
+    if (err == ESP_ERR_INVALID_STATE) err = esp_task_wdt_init(&cfg); /* WDT wasn't started */
+    ESP_ERROR_CHECK(err);
+}
+
+/* =========================================================================
  * Application Entry Point
  * ========================================================================= */
 void app_main(void)
@@ -408,6 +532,7 @@ void app_main(void)
     fx_init();
     button_init();
     serial_init();
+    watchdog_setup();
 
     ESP_LOGI(TAG, "===============================================");
     ESP_LOGI(TAG, "  Something Just Like This - Lyrical Screen    ");
@@ -424,57 +549,46 @@ void app_main(void)
 
     g_playback.is_playing = true;
     g_playback.current_ms = 0;
-    g_playback.last_timer_us = esp_timer_get_time();
     g_playback.active_index = 0;
     g_playback.animation_tick = 0;
 
-    size_t last_logged_index = SIZE_MAX;
-    TickType_t last_wake_time = xTaskGetTickCount();
+    s_free_q = xQueueCreate(FX_SLOTS, sizeof(int));
+    s_ready_q = xQueueCreate(FX_SLOTS, sizeof(frame_msg_t));
+    for (int i = 0; i < FX_SLOTS; i++) xQueueSend(s_free_q, &i, 0);
+    xTaskCreatePinnedToCore(draw_task, "draw", 6144, NULL, 5, NULL, 1);
+
+    /* core 0: finish each drawn frame and stream it to the panel */
+    int prev_slot = -1;
+    int64_t draw_sum = 0, draw_max = 0, fin_sum = 0, fin_max = 0;
+    int frames_n = 0;
+    int64_t stats_t0 = esp_timer_get_time();
 
     while (true) {
-        uint64_t now_us = esp_timer_get_time();
+        frame_msg_t msg;
+        xQueueReceive(s_ready_q, &msg, portMAX_DELAY);
 
-        // Advance playback clock if playing
-        if (g_playback.is_playing) {
-            uint32_t delta_ms = (uint32_t)((now_us - g_playback.last_timer_us) / 1000);
-            // Keep the sub-millisecond remainder so the clock doesn't drift behind the audio
-            g_playback.last_timer_us += (uint64_t)delta_ms * 1000;
-            g_playback.current_ms += delta_ms;
+        int64_t t0 = esp_timer_get_time();
+        fx_finish_frame(msg.slot, frames[msg.slot], &msg.post);
+        int64_t fin_us = esp_timer_get_time() - t0;
 
-            // Loop or clamp at end of song
-            if (g_playback.current_ms >= SONG_TOTAL_DURATION_MS + FX_END_HOLD_MS) {
-                // Auto-loop back to the start after the closing title card
-                g_playback.current_ms = 0;
-                g_playback.active_index = 0;
-                ESP_LOGI(TAG, "Song completed, looping to start...");
-            }
-        } else {
-            g_playback.last_timer_us = now_us;
+        lcd_present_async(frames[msg.slot]); /* waits for the previous frame's DMA first */
+        if (prev_slot >= 0) xQueueSend(s_free_q, &prev_slot, portMAX_DELAY);
+        prev_slot = msg.slot;
+
+        // Report render cost every ~10 s so slow scenes are easy to spot
+        draw_sum += msg.draw_us;
+        fin_sum += fin_us;
+        if (msg.draw_us > draw_max) draw_max = msg.draw_us;
+        if (fin_us > fin_max) fin_max = fin_us;
+        if (++frames_n >= 250) {
+            int64_t now = esp_timer_get_time();
+            ESP_LOGI(TAG, "%.1f fps | draw (core 1) avg %.1f / max %.1f ms | finish (core 0) avg %.1f / max %.1f ms | budget %d ms",
+                     frames_n * 1e6 / (double)(now - stats_t0),
+                     draw_sum / 1000.0 / frames_n, draw_max / 1000.0,
+                     fin_sum / 1000.0 / frames_n, fin_max / 1000.0, FRAME_MS);
+            draw_sum = draw_max = fin_sum = fin_max = 0;
+            frames_n = 0;
+            stats_t0 = now;
         }
-
-        // Update active lyric index
-        g_playback.active_index = find_active_lyric(g_playback.current_ms);
-
-        // Log active line changes to serial
-        if (g_playback.active_index != last_logged_index) {
-            last_logged_index = g_playback.active_index;
-            uint32_t s = g_playback.current_ms / 1000;
-            ESP_LOGI(TAG, "[%02lu:%02lu] %s",
-                     (unsigned long)(s / 60), (unsigned long)(s % 60),
-                     lyrics[g_playback.active_index].text);
-        }
-
-        // Check BOOT button and Serial input
-        handle_button_input(&g_playback);
-        handle_serial_input(&g_playback);
-
-        // Render the lyric-video frame and push it to the ST7735 (~25 FPS)
-        fx_render(frame, g_playback.current_ms, g_playback.active_index,
-                  g_playback.animation_tick, g_playback.is_playing);
-        lcd_present();
-        g_playback.animation_tick++;
-
-        // 40 ms frame interval (~25 FPS) gives the panel controller time to refresh without tearing
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(40));
     }
 }
